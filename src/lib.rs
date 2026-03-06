@@ -47,46 +47,24 @@ pub struct GatherResult {
 /// [local]
 /// my-pkg = "/path/to/pkg"
 /// ```
-/// Helper enum for deserializing string or array of strings
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum StringOrVec {
-    Single(String),
-    Multiple(Vec<String>),
-}
-
-impl Default for StringOrVec {
-    fn default() -> Self {
-        StringOrVec::Multiple(Vec::new())
+/// Deserialize a field that accepts either a single string or an array of strings.
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        Single(String),
+        Multiple(Vec<String>),
+    }
+    match StringOrVec::deserialize(deserializer)? {
+        StringOrVec::Single(s) => Ok(vec![PathBuf::from(s)]),
+        StringOrVec::Multiple(v) => Ok(v.into_iter().map(PathBuf::from).collect()),
     }
 }
 
-impl From<StringOrVec> for Vec<PathBuf> {
-    fn from(value: StringOrVec) -> Self {
-        match value {
-            StringOrVec::Single(s) => vec![PathBuf::from(s)],
-            StringOrVec::Multiple(v) => v.into_iter().map(PathBuf::from).collect(),
-        }
-    }
-}
-
-/// Raw config for deserialization
-#[derive(Debug, Deserialize, Default)]
-struct RawConfig {
-    /// Root directory for resolving relative paths (discover, destination)
-    rootdir: Option<PathBuf>,
-    destination: Option<PathBuf>,
-    #[serde(default)]
-    discover: Option<StringOrVec>,
-    #[serde(default, rename = "package-cache")]
-    package_cache: Option<StringOrVec>,
-    #[serde(default)]
-    preview: HashMap<String, String>,
-    #[serde(default)]
-    local: HashMap<String, String>,
-}
-
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Deserialize)]
 pub struct Config {
     /// Root directory for resolving relative paths (discover, destination).
     /// If set, discover and destination paths are resolved relative to this.
@@ -95,25 +73,16 @@ pub struct Config {
     pub destination: Option<PathBuf>,
     /// Paths to scan for imports. Can be directories (scans .typ files) or individual .typ files.
     /// Accepts either a single path or an array of paths.
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub discover: Vec<PathBuf>,
     /// Paths to package cache directories for resolving transitive @preview deps.
     /// Each directory should have the standard Typst cache layout: `preview/{name}/{version}/`.
+    #[serde(default, rename = "package-cache", deserialize_with = "deserialize_string_or_vec")]
     pub package_cache: Vec<PathBuf>,
+    #[serde(default)]
     pub preview: HashMap<String, String>,
+    #[serde(default)]
     pub local: HashMap<String, String>,
-}
-
-impl From<RawConfig> for Config {
-    fn from(raw: RawConfig) -> Self {
-        Config {
-            rootdir: raw.rootdir,
-            destination: raw.destination,
-            discover: raw.discover.map(Into::into).unwrap_or_default(),
-            package_cache: raw.package_cache.map(Into::into).unwrap_or_default(),
-            preview: raw.preview,
-            local: raw.local,
-        }
-    }
 }
 
 /// A resolved package entry ready for gathering.
@@ -126,8 +95,7 @@ pub enum PackageEntry {
 impl Config {
     /// Parse a TOML configuration string.
     pub fn parse(content: &str) -> Result<Self, toml::de::Error> {
-        let raw: RawConfig = toml::from_str(content)?;
-        Ok(raw.into())
+        toml::from_str(content)
     }
 
     /// Convert config into a list of package entries.
@@ -168,7 +136,7 @@ impl<'a> GatherContext<'a> {
             storage: PackageStorage::new(
                 Some(dest.to_path_buf()),
                 None,
-                Downloader::new("typst-gather/0.1.0"),
+                Downloader::new(concat!("typst-gather/", env!("CARGO_PKG_VERSION"))),
             ),
             dest,
             configured_local,
