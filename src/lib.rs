@@ -77,7 +77,11 @@ pub struct Config {
     pub discover: Vec<PathBuf>,
     /// Paths to package cache directories for resolving transitive @preview deps.
     /// Each directory should have the standard Typst cache layout: `preview/{name}/{version}/`.
-    #[serde(default, rename = "package-cache", deserialize_with = "deserialize_string_or_vec")]
+    #[serde(
+        default,
+        rename = "package-cache",
+        deserialize_with = "deserialize_string_or_vec"
+    )]
     pub package_cache: Vec<PathBuf>,
     #[serde(default)]
     pub preview: HashMap<String, String>,
@@ -724,17 +728,15 @@ pub fn analyze(config: &Config) -> Result<AnalyzeResult, String> {
                             dep.name.to_string(),
                             dep.version.to_string(),
                         );
-                        if !import_map.contains_key(&key) {
-                            import_map.insert(
-                                key,
-                                ImportInfo {
-                                    namespace: dep.namespace.to_string(),
-                                    name: dep.name.to_string(),
-                                    version: dep.version.to_string(),
-                                    source: source_label.clone(),
-                                    direct: false,
-                                },
-                            );
+                        if let std::collections::hash_map::Entry::Vacant(e) = import_map.entry(key)
+                        {
+                            e.insert(ImportInfo {
+                                namespace: dep.namespace.to_string(),
+                                name: dep.name.to_string(),
+                                version: dep.version.to_string(),
+                                source: source_label.clone(),
+                                direct: false,
+                            });
                         }
                         let queue_key = (dep.name.to_string(), dep.version.to_string());
                         if processed.insert(queue_key.clone()) {

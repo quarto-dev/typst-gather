@@ -1,9 +1,24 @@
 {
   "hooks": {
-    "afterEdit": [
+    "PostToolUse": [
       {
-        "matcher": "*.rs",
-        "command": "cargo fmt"
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo fmt"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo clippy -- -D warnings"
+          }
+        ]
       }
     ]
   }
