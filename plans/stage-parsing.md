@@ -162,14 +162,15 @@ pub struct Config {
 Update `From<RawConfig> for Config` to convert `package_cache` the same way
 as `discover`.
 
-No signature change needed for `analyze()` — it already takes `&Config`,
-so adding `package_cache` to `Config` makes it automatically available.
-The rootdir resolution for package_cache paths should be added inside
-`analyze()` alongside the existing rootdir resolution for discover and
-local paths.
+`analyze()` already takes `&Config`, so adding `package_cache` to
+`Config` makes it automatically available. The return type changes from
+`AnalyzeResult` to `Result<AnalyzeResult, String>` because @preview
+packages importing @local is now a hard error. The rootdir resolution
+for package_cache paths should be added inside `analyze()` alongside
+the existing rootdir resolution for discover and local paths.
 
-`run_analyze()` in `main.rs` needs no changes — it already passes
-`&config` to `analyze()`.
+`run_analyze()` in `main.rs` needs a small update to handle the `Result`
+return — map `Err` to an error message on stderr and `ExitCode::FAILURE`.
 
 When `package_cache` is empty (the default), behavior is identical to
 the current init-config implementation (no @preview transitive resolution).
@@ -198,13 +199,18 @@ let package_cache: Vec<PathBuf> = config
     .collect();
 
 if !package_cache.is_empty() {
-    // Seed queue from all @preview imports found so far
-    let mut queue: VecDeque<(String, String)> = import_map
+    // Seed queue from all @preview imports found so far.
+    // Sort for deterministic output — HashMap iteration order is
+    // arbitrary, so without sorting the `source` field for transitive
+    // deps would vary between runs.
+    let mut seed: Vec<(String, String)> = import_map
         .keys()
         .filter(|(ns, _, _)| ns == "preview")
         .map(|(_, name, ver)| (name.clone(), ver.clone()))
         .collect();
+    seed.sort();
 
+    let mut queue: VecDeque<(String, String)> = seed.into_iter().collect();
     let mut processed: HashSet<(String, String)> = queue
         .iter()
         .cloned()
@@ -220,6 +226,19 @@ if !package_cache.is_empty() {
             if pkg_dir.is_dir() {
                 let source_label = format!("@preview/{name}:{version}");
                 for dep in find_imports(&pkg_dir) {
+                    // @preview packages must not import @local packages.
+                    // This indicates a corrupted or hand-edited cache.
+                    if dep.namespace == "local" {
+                        eprintln!(
+                            "Error: @preview/{name}:{version} imports \
+                             @local/{dep_name}:{dep_ver} — a published \
+                             package cannot depend on local packages",
+                            dep_name = dep.name,
+                            dep_ver = dep.version,
+                        );
+                        return Err("@preview package imports @local");
+                    }
+
                     let key = (
                         dep.namespace.to_string(),
                         dep.name.to_string(),
@@ -234,11 +253,9 @@ if !package_cache.is_empty() {
                             direct: false,
                         });
                     }
-                    if dep.namespace == "preview" {
-                        let queue_key = (dep.name.to_string(), dep.version.to_string());
-                        if processed.insert(queue_key.clone()) {
-                            queue.push_back(queue_key);
-                        }
+                    let queue_key = (dep.name.to_string(), dep.version.to_string());
+                    if processed.insert(queue_key.clone()) {
+                        queue.push_back(queue_key);
                     }
                 }
                 break; // found in this cache, don't check others
@@ -258,9 +275,17 @@ Key design decisions:
   cache paths, we scan the first one found. This is about which .typ files
   we read to discover transitive deps — it doesn't affect override semantics
   at staging time (quarto handles that separately with last-write-wins).
-- **Only @preview → @preview recursion**: @preview packages importing @local
-  would be unusual; if encountered, the @local import is reported but not
-  recursed into (same as init-config behavior for @local imports).
+- **@preview → @local is a hard error**: a published @preview package cannot
+  depend on a user-local package. If scanning a @preview package in the
+  cache yields any @local import, print an error to stderr identifying the
+  offending package and import, and return a non-zero exit code. This
+  indicates a corrupted or hand-edited cache.
+- **Deterministic seed queue**: the BFS queue is seeded from `import_map`
+  keys. Because `HashMap` iteration order is arbitrary, the `source` field
+  for transitive deps would otherwise be non-deterministic (e.g. if both A
+  and B depend on C, whichever is dequeued first determines C's `source`).
+  Fix: collect the seed entries into a `Vec`, sort by `(name, version)`,
+  then push into the `VecDeque`. This makes output reproducible.
 - **No warning for cache miss**: if a @preview package isn't in the cache,
   it's still in the results (it was found by direct or @local scanning),
   we just can't resolve its transitive deps. This is not an error — the
@@ -301,10 +326,24 @@ optionally typst.toml manifests.
 
 - **cache_handles_diamond_dependency**: A imports B and C. Both B and C
   import D. Create cache accordingly. D appears once in output
-  (deduplicated). Source is whichever of B or C was processed first.
+  (deduplicated). Source is deterministic due to sorted seed queue —
+  the package that sorts first alphabetically by (name, version)
+  determines D's source.
 
 - **cache_handles_cycle**: cache has A importing B and B importing A.
   No infinite loop. Both appear in output exactly once.
+
+#### @preview → @local is a hard error
+
+- **cache_preview_imports_local_is_error**: cache has @preview/foo:1.0.0
+  with a .typ file importing @local/bar:2.0.0. Document imports
+  @preview/foo. `analyze()` returns an error. Error message on stderr
+  identifies the offending package (@preview/foo:1.0.0) and the @local
+  import (@local/bar:2.0.0). Exit code is non-zero.
+
+- **cache_preview_imports_local_deep_is_error**: A→B, B imports
+  @local/bar. Error is raised when processing B, not silently ignored.
+  The error identifies B as the offending package.
 
 #### Missing packages in cache
 
@@ -434,6 +473,12 @@ with cache support.
 - **rootdir_applies_to_package_cache**: config has rootdir="sub" and
   package-cache="cache". Resolves to sub/cache/. Verify transitive
   resolution works with the resolved path.
+
+- **e2e_preview_imports_local_error**: cache has @preview/foo:1.0.0
+  importing @local/bar:1.0.0. Document imports @preview/foo. Run
+  `typst-gather analyze <config>`. Exit code is non-zero. Stderr
+  contains error message identifying @preview/foo and @local/bar.
+  Stdout is empty (no partial JSON output).
 
 ### Config parsing tests
 

@@ -1,6 +1,6 @@
 [package]
 name = "typst-gather"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 repository = "https://github.com/quarto-dev/typst-gather"
 rust-version = "1.81"

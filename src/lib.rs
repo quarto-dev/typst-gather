@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -77,6 +78,8 @@ struct RawConfig {
     destination: Option<PathBuf>,
     #[serde(default)]
     discover: Option<StringOrVec>,
+    #[serde(default, rename = "package-cache")]
+    package_cache: Option<StringOrVec>,
     #[serde(default)]
     preview: HashMap<String, String>,
     #[serde(default)]
@@ -93,6 +96,9 @@ pub struct Config {
     /// Paths to scan for imports. Can be directories (scans .typ files) or individual .typ files.
     /// Accepts either a single path or an array of paths.
     pub discover: Vec<PathBuf>,
+    /// Paths to package cache directories for resolving transitive @preview deps.
+    /// Each directory should have the standard Typst cache layout: `preview/{name}/{version}/`.
+    pub package_cache: Vec<PathBuf>,
     pub preview: HashMap<String, String>,
     pub local: HashMap<String, String>,
 }
@@ -103,6 +109,7 @@ impl From<RawConfig> for Config {
             rootdir: raw.rootdir,
             destination: raw.destination,
             discover: raw.discover.map(Into::into).unwrap_or_default(),
+            package_cache: raw.package_cache.map(Into::into).unwrap_or_default(),
             preview: raw.preview,
             local: raw.local,
         }
@@ -151,6 +158,8 @@ struct GatherContext<'a> {
     stats: Stats,
     /// @local imports discovered during scanning (name -> source_file)
     discovered_local: HashMap<String, String>,
+    /// Fatal error that should stop gathering (e.g. @preview importing @local)
+    fatal_error: Option<String>,
 }
 
 impl<'a> GatherContext<'a> {
@@ -166,6 +175,7 @@ impl<'a> GatherContext<'a> {
             processed: HashSet::new(),
             stats: Stats::default(),
             discovered_local: HashMap::new(),
+            fatal_error: None,
         }
     }
 }
@@ -176,7 +186,7 @@ pub fn gather_packages(
     entries: Vec<PackageEntry>,
     discover_paths: &[PathBuf],
     configured_local: &HashSet<String>,
-) -> GatherResult {
+) -> Result<GatherResult, String> {
     let mut ctx = GatherContext::new(dest, configured_local);
 
     // First, process discover paths
@@ -196,6 +206,11 @@ pub fn gather_packages(
         }
     }
 
+    // Check for fatal errors (e.g. @preview importing @local)
+    if let Some(err) = ctx.fatal_error {
+        return Err(err);
+    }
+
     // Find @local imports that aren't configured
     let unconfigured_local: Vec<(String, String)> = ctx
         .discovered_local
@@ -203,10 +218,10 @@ pub fn gather_packages(
         .filter(|(name, _)| !ctx.configured_local.contains(name))
         .collect();
 
-    GatherResult {
+    Ok(GatherResult {
         stats: ctx.stats,
         unconfigured_local,
-    }
+    })
 }
 
 /// Scan a path for imports. If it's a directory, scans .typ files in it (non-recursive).
@@ -378,7 +393,7 @@ fn gather_local(ctx: &mut GatherContext, name: &str, src_dir: &Path) {
     ctx.processed.insert(spec.to_string());
 
     // Scan for @preview dependencies
-    scan_deps(ctx, &dest_dir);
+    scan_local_deps(ctx, &dest_dir);
 }
 
 /// Copy directory contents, excluding files that match the exclude patterns.
@@ -410,6 +425,11 @@ fn copy_filtered(src: &Path, dest: &Path, excludes: &globset::GlobSet) -> std::i
 }
 
 fn cache_preview_with_deps(ctx: &mut GatherContext, spec: &PackageSpec) {
+    // Stop if a fatal error has occurred
+    if ctx.fatal_error.is_some() {
+        return;
+    }
+
     // Skip @preview packages that are configured as @local (use local version instead)
     if ctx.configured_local.contains(spec.name.as_str()) {
         return;
@@ -420,13 +440,14 @@ fn cache_preview_with_deps(ctx: &mut GatherContext, spec: &PackageSpec) {
         return;
     }
 
+    let pkg_label = format!("@preview/{}:{}", spec.name, spec.version);
     let subdir = format!("{}/{}/{}", spec.namespace, spec.name, spec.version);
     let cached_path = ctx.storage.package_cache_path().map(|p| p.join(&subdir));
 
     if cached_path.as_ref().is_some_and(|p| p.exists()) {
         eprintln!("Skipping {spec} (cached)");
         ctx.stats.skipped += 1;
-        scan_deps(ctx, cached_path.as_ref().unwrap());
+        scan_preview_deps(ctx, cached_path.as_ref().unwrap(), &pkg_label);
         return;
     }
 
@@ -435,7 +456,7 @@ fn cache_preview_with_deps(ctx: &mut GatherContext, spec: &PackageSpec) {
         Ok(path) => {
             eprintln!("  -> {}", display_path(&path));
             ctx.stats.downloaded += 1;
-            scan_deps(ctx, &path);
+            scan_preview_deps(ctx, &path, &pkg_label);
         }
         Err(e) => {
             eprintln!("  Failed: {e:?}");
@@ -444,7 +465,48 @@ fn cache_preview_with_deps(ctx: &mut GatherContext, spec: &PackageSpec) {
     }
 }
 
-fn scan_deps(ctx: &mut GatherContext, dir: &Path) {
+/// Find imports in a @preview package directory and validate them.
+///
+/// Returns an error if the package imports @local, which is invalid for
+/// published packages and indicates a corrupted or hand-edited cache.
+/// Only returns @preview imports (other namespaces are rejected).
+fn find_preview_package_imports(
+    pkg_dir: &Path,
+    pkg_label: &str,
+) -> Result<Vec<PackageSpec>, String> {
+    let imports = find_imports(pkg_dir);
+    for spec in &imports {
+        if spec.namespace == "local" {
+            return Err(format!(
+                "{pkg_label} imports @local/{}:{} \
+                 — a published package cannot depend on local packages",
+                spec.name, spec.version,
+            ));
+        }
+    }
+    Ok(imports
+        .into_iter()
+        .filter(|s| s.namespace == "preview")
+        .collect())
+}
+
+/// Scan a @preview package's directory for transitive deps, with validation.
+fn scan_preview_deps(ctx: &mut GatherContext, dir: &Path, pkg_label: &str) {
+    match find_preview_package_imports(dir, pkg_label) {
+        Ok(imports) => {
+            for spec in imports {
+                cache_preview_with_deps(ctx, &spec);
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            ctx.fatal_error = Some(e);
+        }
+    }
+}
+
+/// Scan a @local package's directory for @preview deps (no @local validation).
+fn scan_local_deps(ctx: &mut GatherContext, dir: &Path) {
     for spec in find_imports(dir) {
         if spec.namespace == "preview" {
             cache_preview_with_deps(ctx, &spec);
@@ -524,7 +586,12 @@ pub struct ImportInfo {
 ///
 /// Scans discover paths for @preview and @local imports, then follows
 /// transitive @preview deps inside @local package source directories.
-pub fn analyze(config: &Config) -> AnalyzeResult {
+/// When `package_cache` is provided, also follows @preview → @preview
+/// transitive deps by reading from local cache directories.
+///
+/// Returns an error if a @preview package in the cache imports a @local
+/// package, which indicates a corrupted or hand-edited cache.
+pub fn analyze(config: &Config) -> Result<AnalyzeResult, String> {
     let rootdir = config.rootdir.clone();
     let discover: Vec<PathBuf> = config
         .discover
@@ -651,8 +718,71 @@ pub fn analyze(config: &Config) -> AnalyzeResult {
         }
     }
 
+    // Resolve @preview transitive deps from package cache
+    let package_cache: Vec<PathBuf> = config
+        .package_cache
+        .iter()
+        .map(|p| match &rootdir {
+            Some(root) => root.join(p),
+            None => p.clone(),
+        })
+        .collect();
+
+    if !package_cache.is_empty() {
+        // Seed queue from all @preview imports found so far.
+        // Sort for deterministic output — HashMap iteration order is
+        // arbitrary, so without sorting the `source` field for transitive
+        // deps would vary between runs.
+        let mut seed: Vec<(String, String)> = import_map
+            .keys()
+            .filter(|(ns, _, _)| ns == "preview")
+            .map(|(_, name, ver)| (name.clone(), ver.clone()))
+            .collect();
+        seed.sort();
+
+        let mut queue: VecDeque<(String, String)> = seed.into_iter().collect();
+        let mut processed: HashSet<(String, String)> = queue.iter().cloned().collect();
+
+        while let Some((name, version)) = queue.pop_front() {
+            // Find package in cache directories (first match)
+            for cache_dir in &package_cache {
+                let pkg_dir = cache_dir.join("preview").join(&name).join(&version);
+                if pkg_dir.is_dir() {
+                    let source_label = format!("@preview/{name}:{version}");
+                    let deps = find_preview_package_imports(&pkg_dir, &source_label)?;
+                    for dep in deps {
+                        let key = (
+                            dep.namespace.to_string(),
+                            dep.name.to_string(),
+                            dep.version.to_string(),
+                        );
+                        if !import_map.contains_key(&key) {
+                            import_map.insert(
+                                key,
+                                ImportInfo {
+                                    namespace: dep.namespace.to_string(),
+                                    name: dep.name.to_string(),
+                                    version: dep.version.to_string(),
+                                    source: source_label.clone(),
+                                    direct: false,
+                                },
+                            );
+                        }
+                        let queue_key = (dep.name.to_string(), dep.version.to_string());
+                        if processed.insert(queue_key.clone()) {
+                            queue.push_back(queue_key);
+                        }
+                    }
+                    break; // found in this cache, don't check others
+                }
+            }
+            // If not found in any cache: the package is already in the
+            // results, we just can't resolve its transitive deps.
+        }
+    }
+
     let imports = import_map.into_values().collect();
-    AnalyzeResult { imports, files }
+    Ok(AnalyzeResult { imports, files })
 }
 
 /// Analyze a single .typ file for imports, adding them to the import map.
@@ -1064,7 +1194,7 @@ Some content here.
                 discover: vec![dir.path().join("template.typ")],
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             assert_eq!(result.imports.len(), 1);
             assert_eq!(result.imports[0].namespace, "preview");
@@ -1093,7 +1223,7 @@ Some content here.
                     .collect(),
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             let local_import = result
                 .imports
@@ -1119,7 +1249,7 @@ Some content here.
                 discover: vec![dir.path().join("template.typ")],
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             assert_eq!(result.imports.len(), 3);
         }
@@ -1142,7 +1272,7 @@ Some content here.
                 discover: vec![dir.path().to_path_buf()],
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             assert_eq!(result.imports.len(), 2);
             assert_eq!(result.files.len(), 2);
@@ -1161,7 +1291,7 @@ Some content here.
                 discover: vec![dir.path().join("template.typ")],
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             assert_eq!(result.imports.len(), 1);
             assert_eq!(result.imports[0].name, "cetz");
@@ -1180,7 +1310,7 @@ Some content here.
                 discover: vec![dir.path().join("template.typ")],
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             assert_eq!(result.imports.len(), 1);
             assert_eq!(result.imports[0].name, "template");
@@ -1196,7 +1326,7 @@ Some content here.
                 discover: vec![dir.path().join("template.typ")],
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             assert_eq!(result.imports.len(), 1);
         }
@@ -1210,7 +1340,7 @@ Some content here.
                 discover: vec![dir.path().join("template.typ")],
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             assert!(result.imports.is_empty());
         }
@@ -1224,7 +1354,7 @@ Some content here.
                 discover: vec![dir.path().join("template.typ")],
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             assert!(result.imports.is_empty());
             assert_eq!(result.files, vec!["template.typ"]);
@@ -1243,7 +1373,7 @@ Some content here.
                 discover: vec![dir.path().join("template.typ")],
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             assert!(result.imports.is_empty());
         }
@@ -1258,7 +1388,7 @@ Some content here.
                 discover: vec![dir.path().join("template.typ")],
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             assert_eq!(result.imports.len(), 1);
         }
@@ -1273,7 +1403,7 @@ Some content here.
                 discover: vec![dir.path().join("a.typ"), dir.path().join("b.typ")],
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             assert_eq!(result.imports.len(), 1);
             assert!(result.imports[0].direct);
@@ -1289,7 +1419,7 @@ Some content here.
                 discover: vec![dir.path().join("template.typ")],
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             assert_eq!(result.imports.len(), 2);
         }
@@ -1318,7 +1448,7 @@ Some content here.
                     .collect(),
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             let local_import = result
                 .imports
@@ -1429,7 +1559,7 @@ Some content here.
                     .collect(),
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             let cetz = result
                 .imports
@@ -1459,7 +1589,7 @@ Some content here.
                     .collect(),
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             assert_eq!(result.imports.len(), 1);
             assert_eq!(result.imports[0].namespace, "local");
@@ -1485,7 +1615,7 @@ Some content here.
                     .collect(),
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             // Should still have the direct @local import from discover scanning
             let local_import = result
@@ -1515,7 +1645,7 @@ Some content here.
                     .collect(),
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             // Direct import still present from discover scanning
             let local_import = result
@@ -1550,7 +1680,7 @@ Some content here.
                     .collect(),
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             // Should report @local/other-pkg as transitive but not recurse into it
             let other = result
@@ -1576,7 +1706,7 @@ Some content here.
                     .collect(),
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             let import = result
                 .imports
@@ -1600,7 +1730,7 @@ Some content here.
                 discover: vec![dir.path().to_path_buf()],
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             assert_eq!(result.imports.len(), 2);
             assert_eq!(result.files.len(), 2);
@@ -1618,7 +1748,7 @@ Some content here.
                 discover: vec![dir.path().to_path_buf()],
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             // Only a.typ should be found (non-recursive)
             assert_eq!(result.imports.len(), 1);
@@ -1638,7 +1768,7 @@ Some content here.
                 discover: vec![dir.path().join("template.typ")],
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             assert_eq!(result.imports.len(), 1);
             assert_eq!(result.files, vec!["template.typ"]);
@@ -1650,7 +1780,7 @@ Some content here.
                 discover: vec![PathBuf::from("/nonexistent/path.typ")],
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             assert!(result.imports.is_empty());
             assert!(result.files.is_empty());
@@ -1691,7 +1821,7 @@ Some content here.
                 discover: vec![dir.path().join("notes.txt")],
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             assert!(result.imports.is_empty());
         }
@@ -1708,7 +1838,7 @@ Some content here.
                 discover: vec![PathBuf::from("template.typ")],
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             assert_eq!(result.imports.len(), 1);
         }
@@ -1728,7 +1858,7 @@ Some content here.
                     .collect(),
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             let import = result.imports.iter().find(|i| i.name == "my-pkg");
             assert!(import.is_some());
@@ -1744,7 +1874,7 @@ Some content here.
                 discover: vec![dir.path().join("a.typ"), dir.path().join("b.typ")],
                 ..Default::default()
             };
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             assert_eq!(result.files.len(), 2);
             assert!(result.files.contains(&"a.typ".to_string()));
@@ -1754,10 +1884,665 @@ Some content here.
         #[test]
         fn empty_discover() {
             let config = Config::default();
-            let result = analyze(&config);
+            let result = analyze(&config).unwrap();
 
             assert!(result.imports.is_empty());
             assert!(result.files.is_empty());
+        }
+    }
+
+    mod package_cache_config {
+        use super::*;
+
+        #[test]
+        fn package_cache_single_string() {
+            let toml = r#"package-cache = "/path/to/cache""#;
+            let config = Config::parse(toml).unwrap();
+            assert_eq!(config.package_cache, vec![PathBuf::from("/path/to/cache")]);
+        }
+
+        #[test]
+        fn package_cache_array() {
+            let toml = r#"package-cache = ["/a", "/b"]"#;
+            let config = Config::parse(toml).unwrap();
+            assert_eq!(
+                config.package_cache,
+                vec![PathBuf::from("/a"), PathBuf::from("/b")]
+            );
+        }
+
+        #[test]
+        fn package_cache_absent() {
+            let config = Config::parse("").unwrap();
+            assert!(config.package_cache.is_empty());
+        }
+    }
+
+    mod cache_resolution {
+        use super::*;
+        use std::fs;
+        use tempfile::TempDir;
+
+        /// Helper to create a cache package at `cache_dir/preview/{name}/{version}/`
+        fn create_cache_package(cache_dir: &Path, name: &str, version: &str, typ_content: &str) {
+            let pkg_dir = cache_dir.join("preview").join(name).join(version);
+            fs::create_dir_all(&pkg_dir).unwrap();
+            fs::write(pkg_dir.join("lib.typ"), typ_content).unwrap();
+        }
+
+        fn create_local_package(dir: &Path, name: &str, version: &str, typ_content: Option<&str>) {
+            fs::create_dir_all(dir).unwrap();
+            let manifest = format!(
+                "[package]\nname = \"{name}\"\nversion = \"{version}\"\nentrypoint = \"lib.typ\"\n"
+            );
+            fs::write(dir.join("typst.toml"), manifest).unwrap();
+            fs::write(
+                dir.join("lib.typ"),
+                typ_content.unwrap_or("// Empty package\n"),
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn cache_resolves_transitive_preview() {
+            let dir = TempDir::new().unwrap();
+            let cache = dir.path().join("cache");
+            create_cache_package(
+                &cache,
+                "cetz",
+                "0.4.1",
+                r#"#import "@preview/oxifmt:0.2.1""#,
+            );
+            create_cache_package(&cache, "oxifmt", "0.2.1", "// no imports");
+
+            fs::write(
+                dir.path().join("document.typ"),
+                r#"#import "@preview/cetz:0.4.1""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("document.typ")],
+                package_cache: vec![cache],
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            let cetz = result
+                .imports
+                .iter()
+                .find(|i| i.name == "cetz")
+                .expect("should find cetz");
+            assert!(cetz.direct);
+            assert_eq!(cetz.source, "document.typ");
+
+            let oxifmt = result
+                .imports
+                .iter()
+                .find(|i| i.name == "oxifmt")
+                .expect("should find transitive oxifmt");
+            assert!(!oxifmt.direct);
+            assert_eq!(oxifmt.source, "@preview/cetz:0.4.1");
+        }
+
+        #[test]
+        fn cache_resolves_deep_chain() {
+            let dir = TempDir::new().unwrap();
+            let cache = dir.path().join("cache");
+            create_cache_package(
+                &cache,
+                "pkg-a",
+                "1.0.0",
+                r#"#import "@preview/pkg-b:1.0.0""#,
+            );
+            create_cache_package(
+                &cache,
+                "pkg-b",
+                "1.0.0",
+                r#"#import "@preview/pkg-c:1.0.0""#,
+            );
+            create_cache_package(
+                &cache,
+                "pkg-c",
+                "1.0.0",
+                r#"#import "@preview/pkg-d:1.0.0""#,
+            );
+            create_cache_package(&cache, "pkg-d", "1.0.0", "// end of chain");
+
+            fs::write(
+                dir.path().join("doc.typ"),
+                r#"#import "@preview/pkg-a:1.0.0""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("doc.typ")],
+                package_cache: vec![cache],
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            assert_eq!(result.imports.len(), 4);
+            for name in &["pkg-a", "pkg-b", "pkg-c", "pkg-d"] {
+                assert!(
+                    result.imports.iter().any(|i| i.name == *name),
+                    "should find {name}"
+                );
+            }
+
+            let b = result.imports.iter().find(|i| i.name == "pkg-b").unwrap();
+            assert_eq!(b.source, "@preview/pkg-a:1.0.0");
+            let c = result.imports.iter().find(|i| i.name == "pkg-c").unwrap();
+            assert_eq!(c.source, "@preview/pkg-b:1.0.0");
+            let d = result.imports.iter().find(|i| i.name == "pkg-d").unwrap();
+            assert_eq!(d.source, "@preview/pkg-c:1.0.0");
+        }
+
+        #[test]
+        fn cache_handles_diamond_dependency() {
+            let dir = TempDir::new().unwrap();
+            let cache = dir.path().join("cache");
+            // A imports B and C; both B and C import D
+            create_cache_package(
+                &cache,
+                "a",
+                "1.0.0",
+                "#import \"@preview/b:1.0.0\"\n#import \"@preview/c:1.0.0\"\n",
+            );
+            create_cache_package(&cache, "b", "1.0.0", r#"#import "@preview/d:1.0.0""#);
+            create_cache_package(&cache, "c", "1.0.0", r#"#import "@preview/d:1.0.0""#);
+            create_cache_package(&cache, "d", "1.0.0", "// leaf");
+
+            fs::write(dir.path().join("doc.typ"), r#"#import "@preview/a:1.0.0""#).unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("doc.typ")],
+                package_cache: vec![cache],
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            // D appears exactly once (deduplicated)
+            let d_count = result.imports.iter().filter(|i| i.name == "d").count();
+            assert_eq!(d_count, 1);
+            // Source is deterministic: "a" is processed first (seed queue sorted),
+            // then "b" before "c" (alphabetical), so D's source is "@preview/b:1.0.0"
+            let d = result.imports.iter().find(|i| i.name == "d").unwrap();
+            assert_eq!(d.source, "@preview/b:1.0.0");
+        }
+
+        #[test]
+        fn cache_handles_cycle() {
+            let dir = TempDir::new().unwrap();
+            let cache = dir.path().join("cache");
+            create_cache_package(&cache, "a", "1.0.0", r#"#import "@preview/b:1.0.0""#);
+            create_cache_package(&cache, "b", "1.0.0", r#"#import "@preview/a:1.0.0""#);
+
+            fs::write(dir.path().join("doc.typ"), r#"#import "@preview/a:1.0.0""#).unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("doc.typ")],
+                package_cache: vec![cache],
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            assert_eq!(result.imports.len(), 2);
+        }
+
+        #[test]
+        fn cache_preview_imports_local_is_error() {
+            let dir = TempDir::new().unwrap();
+            let cache = dir.path().join("cache");
+            create_cache_package(&cache, "foo", "1.0.0", r#"#import "@local/bar:2.0.0""#);
+
+            fs::write(
+                dir.path().join("doc.typ"),
+                r#"#import "@preview/foo:1.0.0""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("doc.typ")],
+                package_cache: vec![cache],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(err.contains("@preview/foo:1.0.0"));
+            assert!(err.contains("@local/bar:2.0.0"));
+        }
+
+        #[test]
+        fn cache_preview_imports_local_deep_is_error() {
+            let dir = TempDir::new().unwrap();
+            let cache = dir.path().join("cache");
+            create_cache_package(&cache, "a", "1.0.0", r#"#import "@preview/b:1.0.0""#);
+            create_cache_package(&cache, "b", "1.0.0", r#"#import "@local/bar:1.0.0""#);
+
+            fs::write(dir.path().join("doc.typ"), r#"#import "@preview/a:1.0.0""#).unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("doc.typ")],
+                package_cache: vec![cache],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("@preview/b:1.0.0"),
+                "error should identify B, not A"
+            );
+        }
+
+        #[test]
+        fn cache_missing_package_no_crash() {
+            let dir = TempDir::new().unwrap();
+            let cache = dir.path().join("cache");
+            fs::create_dir_all(&cache).unwrap();
+            // Cache exists but does NOT contain preview/foo/1.0.0/
+
+            fs::write(
+                dir.path().join("doc.typ"),
+                r#"#import "@preview/foo:1.0.0""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("doc.typ")],
+                package_cache: vec![cache],
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            assert_eq!(result.imports.len(), 1);
+            assert!(result.imports[0].direct);
+        }
+
+        #[test]
+        fn cache_partial_chain() {
+            let dir = TempDir::new().unwrap();
+            let cache = dir.path().join("cache");
+            create_cache_package(&cache, "a", "1.0.0", r#"#import "@preview/b:1.0.0""#);
+            create_cache_package(&cache, "b", "1.0.0", r#"#import "@preview/c:1.0.0""#);
+            // No c in cache
+
+            fs::write(dir.path().join("doc.typ"), r#"#import "@preview/a:1.0.0""#).unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("doc.typ")],
+                package_cache: vec![cache],
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            // A (direct), B (transitive from A), C (transitive from B, but can't resolve C's deps)
+            assert_eq!(result.imports.len(), 3);
+            assert!(result.imports.iter().any(|i| i.name == "c"));
+        }
+
+        #[test]
+        fn multiple_caches_first_match_scanned() {
+            let dir = TempDir::new().unwrap();
+            let cache1 = dir.path().join("cache1");
+            let cache2 = dir.path().join("cache2");
+            // Same package in both caches, different transitive deps
+            create_cache_package(&cache1, "foo", "1.0.0", r#"#import "@preview/dep-a:1.0.0""#);
+            create_cache_package(&cache1, "dep-a", "1.0.0", "// leaf");
+            create_cache_package(&cache2, "foo", "1.0.0", r#"#import "@preview/dep-b:1.0.0""#);
+            create_cache_package(&cache2, "dep-b", "1.0.0", "// leaf");
+
+            fs::write(
+                dir.path().join("doc.typ"),
+                r#"#import "@preview/foo:1.0.0""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("doc.typ")],
+                package_cache: vec![cache1, cache2],
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            // First cache wins: dep-a should be found, not dep-b
+            assert!(result.imports.iter().any(|i| i.name == "dep-a"));
+            assert!(!result.imports.iter().any(|i| i.name == "dep-b"));
+        }
+
+        #[test]
+        fn multiple_caches_different_packages() {
+            let dir = TempDir::new().unwrap();
+            let cache1 = dir.path().join("cache1");
+            let cache2 = dir.path().join("cache2");
+            create_cache_package(&cache1, "cetz", "0.4.1", "// leaf");
+            create_cache_package(&cache2, "fletcher", "0.5.3", "// leaf");
+
+            fs::write(
+                dir.path().join("doc.typ"),
+                "#import \"@preview/cetz:0.4.1\"\n#import \"@preview/fletcher:0.5.3\"\n",
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("doc.typ")],
+                package_cache: vec![cache1, cache2],
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            assert_eq!(result.imports.len(), 2);
+        }
+
+        #[test]
+        fn multiple_caches_fallthrough() {
+            let dir = TempDir::new().unwrap();
+            let cache1 = dir.path().join("cache1");
+            let cache2 = dir.path().join("cache2");
+            fs::create_dir_all(&cache1).unwrap(); // empty cache
+            create_cache_package(&cache2, "foo", "1.0.0", r#"#import "@preview/dep:1.0.0""#);
+            create_cache_package(&cache2, "dep", "1.0.0", "// leaf");
+
+            fs::write(
+                dir.path().join("doc.typ"),
+                r#"#import "@preview/foo:1.0.0""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("doc.typ")],
+                package_cache: vec![cache1, cache2],
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            assert!(result.imports.iter().any(|i| i.name == "dep"));
+        }
+
+        #[test]
+        fn local_dep_then_cache_follows() {
+            let dir = TempDir::new().unwrap();
+            let cache = dir.path().join("cache");
+            let pkg_dir = dir.path().join("my-pkg-src");
+            create_local_package(
+                &pkg_dir,
+                "my-pkg",
+                "1.0.0",
+                Some(r#"#import "@preview/cetz:0.4.1""#),
+            );
+            create_cache_package(
+                &cache,
+                "cetz",
+                "0.4.1",
+                r#"#import "@preview/oxifmt:0.2.1""#,
+            );
+            create_cache_package(&cache, "oxifmt", "0.2.1", "// leaf");
+
+            fs::write(
+                dir.path().join("doc.typ"),
+                r#"#import "@local/my-pkg:1.0.0""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("doc.typ")],
+                package_cache: vec![cache],
+                local: [("my-pkg".to_string(), pkg_dir.display().to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            // my-pkg (direct, local), cetz (transitive from @local/my-pkg),
+            // oxifmt (transitive from @preview/cetz:0.4.1)
+            assert!(result.imports.iter().any(|i| i.name == "my-pkg"));
+            assert!(result.imports.iter().any(|i| i.name == "cetz"));
+            let oxifmt = result.imports.iter().find(|i| i.name == "oxifmt").unwrap();
+            assert_eq!(oxifmt.source, "@preview/cetz:0.4.1");
+            assert!(!oxifmt.direct);
+        }
+
+        #[test]
+        fn local_and_direct_preview_merged() {
+            let dir = TempDir::new().unwrap();
+            let cache = dir.path().join("cache");
+            let pkg_dir = dir.path().join("my-pkg-src");
+            create_local_package(
+                &pkg_dir,
+                "my-pkg",
+                "1.0.0",
+                Some(r#"#import "@preview/cetz:0.4.1""#),
+            );
+            create_cache_package(
+                &cache,
+                "cetz",
+                "0.4.1",
+                r#"#import "@preview/oxifmt:0.2.1""#,
+            );
+            create_cache_package(&cache, "oxifmt", "0.2.1", "// leaf");
+
+            // Document directly imports cetz AND @local/my-pkg also imports cetz
+            fs::write(
+                dir.path().join("doc.typ"),
+                "#import \"@preview/cetz:0.4.1\"\n#import \"@local/my-pkg:1.0.0\"\n",
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("doc.typ")],
+                package_cache: vec![cache],
+                local: [("my-pkg".to_string(), pkg_dir.display().to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            // Cetz appears once with direct=true
+            let cetz = result.imports.iter().find(|i| i.name == "cetz").unwrap();
+            assert!(cetz.direct);
+            // Its transitive deps from cache should still be resolved
+            assert!(result.imports.iter().any(|i| i.name == "oxifmt"));
+        }
+
+        #[test]
+        fn no_cache_no_preview_resolution() {
+            let dir = TempDir::new().unwrap();
+            let cache = dir.path().join("cache");
+            create_cache_package(
+                &cache,
+                "cetz",
+                "0.4.1",
+                r#"#import "@preview/oxifmt:0.2.1""#,
+            );
+
+            fs::write(
+                dir.path().join("doc.typ"),
+                r#"#import "@preview/cetz:0.4.1""#,
+            )
+            .unwrap();
+
+            // No package_cache configured
+            let config = Config {
+                discover: vec![dir.path().join("doc.typ")],
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            // Only direct import, no transitive resolution
+            assert_eq!(result.imports.len(), 1);
+            assert_eq!(result.imports[0].name, "cetz");
+        }
+
+        #[test]
+        fn no_cache_local_still_resolved() {
+            let dir = TempDir::new().unwrap();
+            let pkg_dir = dir.path().join("my-pkg-src");
+            create_local_package(
+                &pkg_dir,
+                "my-pkg",
+                "1.0.0",
+                Some(r#"#import "@preview/oxifmt:0.2.1""#),
+            );
+
+            fs::write(
+                dir.path().join("doc.typ"),
+                r#"#import "@local/my-pkg:1.0.0""#,
+            )
+            .unwrap();
+
+            // No package_cache, but [local] is configured
+            let config = Config {
+                discover: vec![dir.path().join("doc.typ")],
+                local: [("my-pkg".to_string(), pkg_dir.display().to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            // @local → @preview transitive deps still found
+            assert!(result.imports.iter().any(|i| i.name == "oxifmt"));
+        }
+
+        #[test]
+        fn cache_ignores_non_typ_files() {
+            let dir = TempDir::new().unwrap();
+            let cache = dir.path().join("cache");
+            let pkg_dir = cache.join("preview/foo/1.0.0");
+            fs::create_dir_all(&pkg_dir).unwrap();
+            fs::write(pkg_dir.join("lib.typ"), "// no imports").unwrap();
+            fs::write(
+                pkg_dir.join("data.json"),
+                r#"{"import": "@preview/bar:1.0.0"}"#,
+            )
+            .unwrap();
+            fs::write(pkg_dir.join("notes.txt"), r#"#import "@preview/bar:1.0.0""#).unwrap();
+
+            fs::write(
+                dir.path().join("doc.typ"),
+                r#"#import "@preview/foo:1.0.0""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("doc.typ")],
+                package_cache: vec![cache],
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            // Only foo, no bar (json/txt shouldn't be scanned)
+            assert_eq!(result.imports.len(), 1);
+        }
+
+        #[test]
+        fn cache_scans_subdirectories() {
+            let dir = TempDir::new().unwrap();
+            let cache = dir.path().join("cache");
+            let pkg_dir = cache.join("preview/foo/1.0.0");
+            let sub_dir = pkg_dir.join("src");
+            fs::create_dir_all(&sub_dir).unwrap();
+            fs::write(pkg_dir.join("lib.typ"), "// entry").unwrap();
+            fs::write(sub_dir.join("utils.typ"), r#"#import "@preview/bar:1.0.0""#).unwrap();
+            // Also create bar in cache so we can verify it's found
+            create_cache_package(&cache, "bar", "1.0.0", "// leaf");
+
+            fs::write(
+                dir.path().join("doc.typ"),
+                r#"#import "@preview/foo:1.0.0""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("doc.typ")],
+                package_cache: vec![cache],
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            assert!(
+                result.imports.iter().any(|i| i.name == "bar"),
+                "should find import from subdirectory"
+            );
+        }
+
+        #[test]
+        fn empty_cache_package_dir() {
+            let dir = TempDir::new().unwrap();
+            let cache = dir.path().join("cache");
+            let pkg_dir = cache.join("preview/foo/1.0.0");
+            fs::create_dir_all(&pkg_dir).unwrap();
+            // No .typ files in the package dir
+
+            fs::write(
+                dir.path().join("doc.typ"),
+                r#"#import "@preview/foo:1.0.0""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("doc.typ")],
+                package_cache: vec![cache],
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            // Just the direct import, no crash
+            assert_eq!(result.imports.len(), 1);
+        }
+
+        #[test]
+        fn cache_with_invalid_typ() {
+            let dir = TempDir::new().unwrap();
+            let cache = dir.path().join("cache");
+            let pkg_dir = cache.join("preview/foo/1.0.0");
+            fs::create_dir_all(&pkg_dir).unwrap();
+            fs::write(pkg_dir.join("lib.typ"), "#let broken = {{{[[[").unwrap();
+
+            fs::write(
+                dir.path().join("doc.typ"),
+                r#"#import "@preview/foo:1.0.0""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("doc.typ")],
+                package_cache: vec![cache],
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            // Should not crash, just the direct import
+            assert!(result.imports.iter().any(|i| i.name == "foo"));
+        }
+
+        #[test]
+        fn rootdir_applies_to_package_cache() {
+            let dir = TempDir::new().unwrap();
+            let sub = dir.path().join("sub");
+            let cache = sub.join("cache");
+            create_cache_package(
+                &cache,
+                "cetz",
+                "0.4.1",
+                r#"#import "@preview/oxifmt:0.2.1""#,
+            );
+            create_cache_package(&cache, "oxifmt", "0.2.1", "// leaf");
+            fs::write(sub.join("doc.typ"), r#"#import "@preview/cetz:0.4.1""#).unwrap();
+
+            let config = Config {
+                rootdir: Some(sub),
+                discover: vec![PathBuf::from("doc.typ")],
+                package_cache: vec![PathBuf::from("cache")],
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            assert!(result.imports.iter().any(|i| i.name == "oxifmt"));
         }
     }
 }

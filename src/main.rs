@@ -87,7 +87,13 @@ fn run_gather(config_path: &str) -> ExitCode {
     let configured_local: HashSet<String> = config.local.keys().cloned().collect();
 
     let entries = config.into_entries();
-    let result = gather_packages(&dest, entries, &discover, &configured_local);
+    let result = match gather_packages(&dest, entries, &discover, &configured_local) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // Check for unconfigured @local imports FIRST (this is an error)
     if !result.unconfigured_local.is_empty() {
@@ -132,7 +138,13 @@ fn run_analyze(config_path: &str) -> ExitCode {
         }
     };
 
-    let result = analyze(&config);
+    let result = match analyze(&config) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     match serde_json::to_string_pretty(&result) {
         Ok(json) => {
             println!("{json}");

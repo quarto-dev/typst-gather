@@ -45,7 +45,7 @@ mod local_packages {
         }];
 
         let configured_local: HashSet<String> = ["my-pkg".to_string()].into_iter().collect();
-        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local);
+        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local).unwrap();
 
         assert_eq!(result.stats.copied, 1);
         assert_eq!(result.stats.failed, 0);
@@ -71,13 +71,13 @@ mod local_packages {
         }];
 
         let configured_local: HashSet<String> = ["my-pkg".to_string()].into_iter().collect();
-        gather_packages(cache_dir.path(), entries.clone(), &[], &configured_local);
+        gather_packages(cache_dir.path(), entries.clone(), &[], &configured_local).unwrap();
 
         // Update source
         fs::write(src_dir.path().join("lib.typ"), "// v2").unwrap();
 
         // Cache again
-        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local);
+        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local).unwrap();
         assert_eq!(result.stats.copied, 1);
 
         // Verify new content
@@ -109,7 +109,7 @@ mod local_packages {
         let configured_local: HashSet<String> = ["pkg-one".to_string(), "pkg-two".to_string()]
             .into_iter()
             .collect();
-        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local);
+        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local).unwrap();
 
         assert_eq!(result.stats.copied, 2);
         assert!(cache_dir.path().join("local/pkg-one/1.0.0").exists());
@@ -130,7 +130,7 @@ mod local_packages {
         }];
 
         let configured_local: HashSet<String> = ["wrong-name".to_string()].into_iter().collect();
-        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local);
+        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local).unwrap();
 
         assert_eq!(result.stats.copied, 0);
         assert_eq!(result.stats.failed, 1);
@@ -151,7 +151,7 @@ mod local_packages {
         }];
 
         let configured_local: HashSet<String> = ["my-pkg".to_string()].into_iter().collect();
-        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local);
+        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local).unwrap();
 
         assert_eq!(result.stats.copied, 0);
         assert_eq!(result.stats.failed, 1);
@@ -167,7 +167,7 @@ mod local_packages {
         }];
 
         let configured_local: HashSet<String> = ["my-pkg".to_string()].into_iter().collect();
-        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local);
+        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local).unwrap();
 
         assert_eq!(result.stats.copied, 0);
         assert_eq!(result.stats.failed, 1);
@@ -191,7 +191,7 @@ mod local_packages {
         }];
 
         let configured_local: HashSet<String> = ["my-pkg".to_string()].into_iter().collect();
-        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local);
+        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local).unwrap();
 
         assert_eq!(result.stats.copied, 1);
 
@@ -332,7 +332,7 @@ my-pkg = "{}"
         let dest = config.destination.clone().unwrap();
         let configured_local: HashSet<String> = config.local.keys().cloned().collect();
         let entries = config.into_entries();
-        let result = gather_packages(&dest, entries, &[], &configured_local);
+        let result = gather_packages(&dest, entries, &[], &configured_local).unwrap();
 
         assert_eq!(result.stats.copied, 1);
         assert!(cache_dir.path().join("local/my-pkg/1.0.0").exists());
@@ -350,7 +350,7 @@ my-pkg = "{}"
         let dest = config.destination.clone().unwrap();
         let configured_local: HashSet<String> = config.local.keys().cloned().collect();
         let entries = config.into_entries();
-        let result = gather_packages(&dest, entries, &[], &configured_local);
+        let result = gather_packages(&dest, entries, &[], &configured_local).unwrap();
 
         assert_eq!(result.stats.downloaded, 0);
         assert_eq!(result.stats.copied, 0);
@@ -410,7 +410,8 @@ mod unconfigured_local {
         let configured_local: HashSet<String> = HashSet::new();
         let discover = vec![discover_dir.path().to_path_buf()];
 
-        let result = gather_packages(cache_dir.path(), vec![], &discover, &configured_local);
+        let result =
+            gather_packages(cache_dir.path(), vec![], &discover, &configured_local).unwrap();
 
         // Should have one unconfigured local
         assert_eq!(result.unconfigured_local.len(), 1);
@@ -430,7 +431,8 @@ mod unconfigured_local {
         let configured_local: HashSet<String> = ["my-pkg".to_string()].into_iter().collect();
         let discover = vec![discover_dir.path().to_path_buf()];
 
-        let result = gather_packages(cache_dir.path(), vec![], &discover, &configured_local);
+        let result =
+            gather_packages(cache_dir.path(), vec![], &discover, &configured_local).unwrap();
 
         // Should have no unconfigured local
         assert!(result.unconfigured_local.is_empty());
@@ -1075,6 +1077,118 @@ mod analyze_integration {
         // Stdout should be empty (no partial JSON)
         assert!(output.stdout.is_empty());
     }
+
+    #[test]
+    fn large_dependency_tree() {
+        let dir = TempDir::new().unwrap();
+        let cache = dir.path().join("cache");
+
+        // Create a chain of 15 packages: pkg-01 → pkg-02 → ... → pkg-15
+        for i in 1..=15 {
+            let name = format!("pkg-{i:02}");
+            let pkg_dir = cache.join(format!("preview/{name}/1.0.0"));
+            fs::create_dir_all(&pkg_dir).unwrap();
+            if i < 15 {
+                let next = format!("pkg-{:02}", i + 1);
+                fs::write(
+                    pkg_dir.join("lib.typ"),
+                    format!(r#"#import "@preview/{next}:1.0.0""#),
+                )
+                .unwrap();
+            } else {
+                fs::write(pkg_dir.join("lib.typ"), "// end of chain").unwrap();
+            }
+        }
+
+        fs::write(
+            dir.path().join("doc.typ"),
+            r#"#import "@preview/pkg-01:1.0.0""#,
+        )
+        .unwrap();
+
+        let config_content = format!(
+            "discover = [\"{dir}/doc.typ\"]\npackage-cache = [\"{cache}\"]\n",
+            dir = dir.path().display().to_string().replace('\\', "/"),
+            cache = cache.display().to_string().replace('\\', "/"),
+        );
+        let config_file = dir.path().join("config.toml");
+        fs::write(&config_file, &config_content).unwrap();
+
+        let output = Command::new(cargo_bin())
+            .args(["analyze", config_file.to_str().unwrap()])
+            .output()
+            .expect("failed to run");
+
+        assert!(output.status.success());
+        let json: Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+        let imports = json["imports"].as_array().unwrap();
+        assert_eq!(imports.len(), 15);
+    }
+
+    #[test]
+    fn package_cache_path_nonexistent() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("doc.typ"),
+            r#"#import "@preview/cetz:0.4.1""#,
+        )
+        .unwrap();
+
+        let config_content = format!(
+            "discover = [\"{dir}/doc.typ\"]\npackage-cache = [\"/nonexistent/cache/path\"]\n",
+            dir = dir.path().display().to_string().replace('\\', "/"),
+        );
+        let config_file = dir.path().join("config.toml");
+        fs::write(&config_file, &config_content).unwrap();
+
+        let output = Command::new(cargo_bin())
+            .args(["analyze", config_file.to_str().unwrap()])
+            .output()
+            .expect("failed to run");
+
+        // Should succeed — direct imports still reported
+        assert!(output.status.success());
+        let json: Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+        let imports = json["imports"].as_array().unwrap();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0]["name"], "cetz");
+    }
+
+    #[test]
+    fn package_cache_path_is_file() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("doc.typ"),
+            r#"#import "@preview/cetz:0.4.1""#,
+        )
+        .unwrap();
+        // Create a file where a cache dir is expected
+        fs::write(dir.path().join("not-a-dir"), "this is a file").unwrap();
+
+        let config_content = format!(
+            "discover = [\"{dir}/doc.typ\"]\npackage-cache = [\"{notdir}\"]\n",
+            dir = dir.path().display().to_string().replace('\\', "/"),
+            notdir = dir
+                .path()
+                .join("not-a-dir")
+                .display()
+                .to_string()
+                .replace('\\', "/"),
+        );
+        let config_file = dir.path().join("config.toml");
+        fs::write(&config_file, &config_content).unwrap();
+
+        let output = Command::new(cargo_bin())
+            .args(["analyze", config_file.to_str().unwrap()])
+            .output()
+            .expect("failed to run");
+
+        // Should succeed — that cache path is skipped, direct imports still reported
+        assert!(output.status.success());
+        let json: Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+        let imports = json["imports"].as_array().unwrap();
+        assert_eq!(imports.len(), 1);
+    }
 }
 
 /// Tests that require network access.
@@ -1093,7 +1207,7 @@ mod network {
         }];
 
         let configured_local = HashSet::new();
-        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local);
+        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local).unwrap();
 
         assert_eq!(result.stats.downloaded, 1);
         assert_eq!(result.stats.failed, 0);
@@ -1115,7 +1229,7 @@ mod network {
         }];
 
         let configured_local = HashSet::new();
-        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local);
+        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local).unwrap();
 
         // Should download cetz plus its dependencies
         assert!(result.stats.downloaded >= 1);
@@ -1135,11 +1249,12 @@ mod network {
         let configured_local = HashSet::new();
 
         // First download
-        let result1 = gather_packages(cache_dir.path(), entries.clone(), &[], &configured_local);
+        let result1 =
+            gather_packages(cache_dir.path(), entries.clone(), &[], &configured_local).unwrap();
         assert_eq!(result1.stats.downloaded, 1);
 
         // Second run should skip
-        let result2 = gather_packages(cache_dir.path(), entries, &[], &configured_local);
+        let result2 = gather_packages(cache_dir.path(), entries, &[], &configured_local).unwrap();
         assert_eq!(result2.stats.downloaded, 0);
         assert_eq!(result2.stats.skipped, 1);
     }
@@ -1155,7 +1270,7 @@ mod network {
         }];
 
         let configured_local = HashSet::new();
-        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local);
+        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local).unwrap();
 
         assert_eq!(result.stats.downloaded, 0);
         assert_eq!(result.stats.failed, 1);
@@ -1181,7 +1296,7 @@ mod network {
         }];
 
         let configured_local: HashSet<String> = ["my-pkg".to_string()].into_iter().collect();
-        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local);
+        let result = gather_packages(cache_dir.path(), entries, &[], &configured_local).unwrap();
 
         assert_eq!(result.stats.copied, 1);
         assert!(result.stats.downloaded >= 1); // Should have downloaded example
