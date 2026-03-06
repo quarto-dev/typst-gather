@@ -342,7 +342,10 @@ my-pkg = "{}"
     fn empty_config_does_nothing() {
         let cache_dir = TempDir::new().unwrap();
 
-        let toml = format!(r#"destination = "{}""#, cache_dir.path().display().to_string().replace('\\', "/"));
+        let toml = format!(
+            r#"destination = "{}""#,
+            cache_dir.path().display().to_string().replace('\\', "/")
+        );
         let config = Config::parse(&toml).unwrap();
         let dest = config.destination.clone().unwrap();
         let configured_local: HashSet<String> = config.local.keys().cloned().collect();

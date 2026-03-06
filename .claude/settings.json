@@ -1,0 +1,10 @@
+{
+  "hooks": {
+    "afterEdit": [
+      {
+        "matcher": "*.rs",
+        "command": "cargo fmt"
+      }
+    ]
+  }
+}
