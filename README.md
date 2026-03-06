@@ -14,7 +14,22 @@ cargo install --path .
 typst-gather packages.toml
 ```
 
-Then set `TYPST_PACKAGE_CACHE_PATH` to the destination directory when running Typst.
+Then point both `TYPST_PACKAGE_CACHE_PATH` and `TYPST_PACKAGE_PATH` at the
+destination directory so Typst can resolve both `@preview` and `@local` packages:
+
+```bash
+export TYPST_PACKAGE_CACHE_PATH=/path/to/packages
+export TYPST_PACKAGE_PATH=/path/to/packages
+typst compile document.typ
+```
+
+Or equivalently, using CLI flags:
+
+```bash
+typst compile document.typ \
+  --package-cache-path /path/to/packages \
+  --package-path /path/to/packages
+```
 
 ## TOML format
 
@@ -35,21 +50,32 @@ fontawesome = "0.5.0"
 my-template = "/path/to/src"
 ```
 
-- `destination` - Required. Directory where packages will be gathered.
-- `discover` - Optional. Paths to scan for imports. Can be:
+- `destination` — Required. Directory where packages will be gathered.
+- `discover` — Optional. Paths to scan for `#import` statements. Can be:
   - A single string path
   - An array of paths
   - Each path can be a `.typ` file or a directory (scans `.typ` files non-recursively)
-- `[preview]` packages are downloaded from Typst Universe (cached - skipped if already present)
-- `[local]` packages are copied from the specified directory (always fresh - version read from `typst.toml`)
+- `[preview]` — Packages downloaded from Typst Universe. Skipped if already cached.
+- `[local]` — Packages copied from a local directory. The source must contain a
+  `typst.toml` manifest with `name` and `version` fields. Always copies fresh
+  (overwrites any existing version).
 
-## Features
+## How it works
 
-- Recursively resolves `@preview` dependencies from `#import` statements
-- Uses Typst's own parser for reliable import detection
-- Discover mode scans .typ files for imports
-- Local packages always overwrite (clean slate)
-- Preview packages skip if already cached
+Both `@preview` and `@local` packages are written to the `destination` directory
+using Typst's standard cache layout:
+
+```
+destination/
+├── preview/
+│   ├── cetz/0.4.1/
+│   └── fontawesome/0.5.0/
+└── local/
+    └── my-template/1.0.0/
+```
+
+Recursively resolves `@preview` dependencies from `#import` statements using
+Typst's own parser for reliable import detection.
 
 ## Quarto Integration
 

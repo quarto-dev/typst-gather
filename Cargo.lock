@@ -2220,7 +2220,7 @@ checksum = "5613cb719a6222fe9b74027c3625d107767ec187bff26b8fc931cf58942c834f"
 
 [[package]]
 name = "typst-gather"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "ecow",
