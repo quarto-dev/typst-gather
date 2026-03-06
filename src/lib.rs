@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use ecow::EcoString;
 use globset::{Glob, GlobSetBuilder};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use typst_kit::download::{Downloader, ProgressSink};
 use typst_kit::package::PackageStorage;
 use typst_syntax::ast;
@@ -215,12 +215,12 @@ fn discover_imports(ctx: &mut GatherContext, path: &Path) {
     if path.is_file() {
         // Single file
         if path.extension().is_some_and(|e| e == "typ") {
-            println!("Discovering imports in {}...", display_path(path));
+            eprintln!("Discovering imports in {}...", display_path(path));
             scan_file_for_imports(ctx, path);
         }
     } else if path.is_dir() {
         // Directory - scan .typ files (non-recursive)
-        println!("Discovering imports in {}...", display_path(path));
+        eprintln!("Discovering imports in {}...", display_path(path));
 
         let entries = match std::fs::read_dir(path) {
             Ok(e) => e,
@@ -331,7 +331,7 @@ fn gather_local(ctx: &mut GatherContext, name: &str, src_dir: &Path) {
     let version = manifest.package.version;
     let dest_dir = ctx.dest.join(format!("local/{name}/{version}"));
 
-    println!("Copying @local/{name}:{version}...");
+    eprintln!("Copying @local/{name}:{version}...");
 
     // Clean slate: remove destination if exists
     if dest_dir.exists() {
@@ -366,7 +366,7 @@ fn gather_local(ctx: &mut GatherContext, name: &str, src_dir: &Path) {
         return;
     }
 
-    println!("  -> {}", display_path(&dest_dir));
+    eprintln!("  -> {}", display_path(&dest_dir));
     ctx.stats.copied += 1;
 
     // Mark as processed
@@ -424,16 +424,16 @@ fn cache_preview_with_deps(ctx: &mut GatherContext, spec: &PackageSpec) {
     let cached_path = ctx.storage.package_cache_path().map(|p| p.join(&subdir));
 
     if cached_path.as_ref().is_some_and(|p| p.exists()) {
-        println!("Skipping {spec} (cached)");
+        eprintln!("Skipping {spec} (cached)");
         ctx.stats.skipped += 1;
         scan_deps(ctx, cached_path.as_ref().unwrap());
         return;
     }
 
-    println!("Downloading {spec}...");
+    eprintln!("Downloading {spec}...");
     match ctx.storage.prepare_package(spec, &mut ProgressSink) {
         Ok(path) => {
-            println!("  -> {}", display_path(&path));
+            eprintln!("  -> {}", display_path(&path));
             ctx.stats.downloaded += 1;
             scan_deps(ctx, &path);
         }
@@ -501,6 +501,198 @@ pub fn try_extract_spec(expr: ast::Expr) -> Option<PackageSpec> {
         }
     }
     None
+}
+
+/// Result of an analyze operation.
+#[derive(Debug, Serialize)]
+pub struct AnalyzeResult {
+    pub imports: Vec<ImportInfo>,
+    pub files: Vec<String>,
+}
+
+/// Information about a discovered import.
+#[derive(Debug, Serialize, Clone)]
+pub struct ImportInfo {
+    pub namespace: String,
+    pub name: String,
+    pub version: String,
+    pub source: String,
+    pub direct: bool,
+}
+
+/// Analyze imports without downloading or copying anything.
+///
+/// Scans discover paths for @preview and @local imports, then follows
+/// transitive @preview deps inside @local package source directories.
+pub fn analyze(config: &Config) -> AnalyzeResult {
+    let rootdir = config.rootdir.clone();
+    let discover: Vec<PathBuf> = config
+        .discover
+        .iter()
+        .map(|p| match &rootdir {
+            Some(root) => root.join(p),
+            None => p.clone(),
+        })
+        .collect();
+
+    // (namespace, name, version) -> ImportInfo, for deduplication
+    let mut import_map: HashMap<(String, String, String), ImportInfo> = HashMap::new();
+    let mut files: Vec<String> = Vec::new();
+
+    // Scan discover paths
+    for path in &discover {
+        if path.is_file() {
+            if path.extension().is_some_and(|e| e == "typ") {
+                eprintln!("Analyzing imports in {}...", display_path(path));
+                let filename = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                if !files.contains(&filename) {
+                    files.push(filename.clone());
+                }
+                analyze_file(path, &filename, true, &mut import_map);
+            }
+        } else if path.is_dir() {
+            eprintln!("Analyzing imports in {}...", display_path(path));
+            let entries = match std::fs::read_dir(path) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("  Failed to read directory: {e}");
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
+                let file_path = entry.path();
+                if file_path.is_file() && file_path.extension().is_some_and(|e| e == "typ") {
+                    let filename = file_path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| file_path.display().to_string());
+                    if !files.contains(&filename) {
+                        files.push(filename.clone());
+                    }
+                    analyze_file(&file_path, &filename, true, &mut import_map);
+                }
+            }
+        } else {
+            eprintln!(
+                "Warning: discover path does not exist: {}",
+                display_path(path)
+            );
+        }
+    }
+
+    // Process @local packages for transitive deps
+    for (name, dir_str) in &config.local {
+        let dir = match &rootdir {
+            Some(root) => root.join(dir_str),
+            None => PathBuf::from(dir_str),
+        };
+
+        // Read typst.toml to get version
+        let manifest_path = dir.join("typst.toml");
+        let manifest: Option<PackageManifest> = match std::fs::read_to_string(&manifest_path)
+            .map_err(|e| e.to_string())
+            .and_then(|s| toml::from_str(&s).map_err(|e| e.to_string()))
+        {
+            Ok(m) => Some(m),
+            Err(e) => {
+                if dir.exists() {
+                    eprintln!("Warning: could not read typst.toml for @local/{name}: {e}");
+                } else {
+                    eprintln!(
+                        "Warning: source directory does not exist for @local/{name}: {}",
+                        display_path(&dir)
+                    );
+                }
+                None
+            }
+        };
+
+        // If we have a manifest, add an @local import entry with its version
+        // and scan for transitive @preview deps
+        if let Some(ref manifest) = manifest {
+            let version = manifest.package.version.to_string();
+            let key = ("local".to_string(), name.clone(), version.clone());
+            // Only add if not already present as direct import
+            import_map.entry(key).or_insert(ImportInfo {
+                namespace: "local".to_string(),
+                name: name.clone(),
+                version,
+                source: format!("@local/{name}"),
+                direct: false,
+            });
+
+            // Scan source dir for transitive @preview imports
+            let source_label = format!("@local/{name}");
+            for spec in find_imports(&dir) {
+                let key = (
+                    spec.namespace.to_string(),
+                    spec.name.to_string(),
+                    spec.version.to_string(),
+                );
+                let entry = import_map.entry(key);
+                match entry {
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        // keep existing (direct wins over transitive)
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(ImportInfo {
+                            namespace: spec.namespace.to_string(),
+                            name: spec.name.to_string(),
+                            version: spec.version.to_string(),
+                            source: source_label.clone(),
+                            direct: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let imports = import_map.into_values().collect();
+    AnalyzeResult { imports, files }
+}
+
+/// Analyze a single .typ file for imports, adding them to the import map.
+fn analyze_file(
+    path: &Path,
+    source: &str,
+    direct: bool,
+    import_map: &mut HashMap<(String, String, String), ImportInfo>,
+) {
+    if let Ok(content) = std::fs::read_to_string(path) {
+        let mut imports = Vec::new();
+        collect_imports(&typst_syntax::parse(&content), &mut imports);
+
+        for spec in imports {
+            let key = (
+                spec.namespace.to_string(),
+                spec.name.to_string(),
+                spec.version.to_string(),
+            );
+            let entry = import_map.entry(key);
+            match entry {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    // direct wins over transitive
+                    if direct && !e.get().direct {
+                        e.get_mut().direct = true;
+                        e.get_mut().source = source.to_string();
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(ImportInfo {
+                        namespace: spec.namespace.to_string(),
+                        name: spec.name.to_string(),
+                        version: spec.version.to_string(),
+                        source: source.to_string(),
+                        direct,
+                    });
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -838,6 +1030,734 @@ Some content here.
             assert!(!excludes.is_match("typst.toml"));
             assert!(!excludes.is_match("src/main.typ"));
             assert!(!excludes.is_match("template/main.typ"));
+        }
+    }
+
+    mod analyze_tests {
+        use super::*;
+        use std::fs;
+        use tempfile::TempDir;
+
+        fn create_local_package(dir: &Path, name: &str, version: &str, typ_content: Option<&str>) {
+            fs::create_dir_all(dir).unwrap();
+            let manifest = format!(
+                "[package]\nname = \"{name}\"\nversion = \"{version}\"\nentrypoint = \"lib.typ\"\n"
+            );
+            fs::write(dir.join("typst.toml"), manifest).unwrap();
+            fs::write(
+                dir.join("lib.typ"),
+                typ_content.unwrap_or("// Empty package\n"),
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn single_preview_import() {
+            let dir = TempDir::new().unwrap();
+            fs::write(
+                dir.path().join("template.typ"),
+                r#"#import "@preview/cetz:0.4.1""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("template.typ")],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            assert_eq!(result.imports.len(), 1);
+            assert_eq!(result.imports[0].namespace, "preview");
+            assert_eq!(result.imports[0].name, "cetz");
+            assert_eq!(result.imports[0].version, "0.4.1");
+            assert_eq!(result.imports[0].source, "template.typ");
+            assert!(result.imports[0].direct);
+        }
+
+        #[test]
+        fn single_local_import() {
+            let dir = TempDir::new().unwrap();
+            let pkg_dir = dir.path().join("my-pkg-src");
+            create_local_package(&pkg_dir, "my-pkg", "1.0.0", None);
+
+            fs::write(
+                dir.path().join("template.typ"),
+                r#"#import "@local/my-pkg:1.0.0""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("template.typ")],
+                local: [("my-pkg".to_string(), pkg_dir.display().to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            let local_import = result
+                .imports
+                .iter()
+                .find(|i| i.namespace == "local" && i.name == "my-pkg")
+                .expect("should find @local/my-pkg");
+            assert_eq!(local_import.version, "1.0.0");
+            assert!(local_import.direct);
+            assert_eq!(local_import.source, "template.typ");
+        }
+
+        #[test]
+        fn multiple_imports_single_file() {
+            let dir = TempDir::new().unwrap();
+            let content = r#"
+#import "@preview/cetz:0.4.1"
+#import "@preview/fletcher:0.5.3"
+#import "@local/my-pkg:1.0.0"
+"#;
+            fs::write(dir.path().join("template.typ"), content).unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("template.typ")],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            assert_eq!(result.imports.len(), 3);
+        }
+
+        #[test]
+        fn multiple_files() {
+            let dir = TempDir::new().unwrap();
+            fs::write(
+                dir.path().join("template.typ"),
+                r#"#import "@preview/cetz:0.4.1""#,
+            )
+            .unwrap();
+            fs::write(
+                dir.path().join("show.typ"),
+                r#"#import "@preview/fletcher:0.5.3""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().to_path_buf()],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            assert_eq!(result.imports.len(), 2);
+            assert_eq!(result.files.len(), 2);
+        }
+
+        #[test]
+        fn import_with_items() {
+            let dir = TempDir::new().unwrap();
+            fs::write(
+                dir.path().join("template.typ"),
+                r#"#import "@preview/cetz:0.4.1": canvas, draw"#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("template.typ")],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            assert_eq!(result.imports.len(), 1);
+            assert_eq!(result.imports[0].name, "cetz");
+        }
+
+        #[test]
+        fn include_statement() {
+            let dir = TempDir::new().unwrap();
+            fs::write(
+                dir.path().join("template.typ"),
+                r#"#include "@preview/template:1.0.0""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("template.typ")],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            assert_eq!(result.imports.len(), 1);
+            assert_eq!(result.imports[0].name, "template");
+        }
+
+        #[test]
+        fn nested_import_in_function() {
+            let dir = TempDir::new().unwrap();
+            let code = "#let f() = {\n  import \"@preview/cetz:0.4.1\"\n}\n";
+            fs::write(dir.path().join("template.typ"), code).unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("template.typ")],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            assert_eq!(result.imports.len(), 1);
+        }
+
+        #[test]
+        fn relative_import_ignored() {
+            let dir = TempDir::new().unwrap();
+            fs::write(dir.path().join("template.typ"), r#"#import "utils.typ""#).unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("template.typ")],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            assert!(result.imports.is_empty());
+        }
+
+        #[test]
+        fn no_imports() {
+            let dir = TempDir::new().unwrap();
+            fs::write(dir.path().join("template.typ"), "= Hello World").unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("template.typ")],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            assert!(result.imports.is_empty());
+            assert_eq!(result.files, vec!["template.typ"]);
+        }
+
+        #[test]
+        fn invalid_package_spec_ignored() {
+            let dir = TempDir::new().unwrap();
+            fs::write(
+                dir.path().join("template.typ"),
+                r#"#import "@preview/cetz""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("template.typ")],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            assert!(result.imports.is_empty());
+        }
+
+        #[test]
+        fn duplicate_import_same_file() {
+            let dir = TempDir::new().unwrap();
+            let content = "#import \"@preview/cetz:0.4.1\"\n#import \"@preview/cetz:0.4.1\"\n";
+            fs::write(dir.path().join("template.typ"), content).unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("template.typ")],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            assert_eq!(result.imports.len(), 1);
+        }
+
+        #[test]
+        fn duplicate_import_across_files() {
+            let dir = TempDir::new().unwrap();
+            fs::write(dir.path().join("a.typ"), r#"#import "@preview/cetz:0.4.1""#).unwrap();
+            fs::write(dir.path().join("b.typ"), r#"#import "@preview/cetz:0.4.1""#).unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("a.typ"), dir.path().join("b.typ")],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            assert_eq!(result.imports.len(), 1);
+            assert!(result.imports[0].direct);
+        }
+
+        #[test]
+        fn different_versions_not_deduped() {
+            let dir = TempDir::new().unwrap();
+            let content = "#import \"@preview/cetz:0.4.1\"\n#import \"@preview/cetz:0.5.0\"\n";
+            fs::write(dir.path().join("template.typ"), content).unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("template.typ")],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            assert_eq!(result.imports.len(), 2);
+        }
+
+        #[test]
+        fn local_with_preview_dep() {
+            let dir = TempDir::new().unwrap();
+            let pkg_dir = dir.path().join("my-pkg-src");
+            create_local_package(
+                &pkg_dir,
+                "my-pkg",
+                "1.0.0",
+                Some(r#"#import "@preview/oxifmt:0.2.1""#),
+            );
+
+            fs::write(
+                dir.path().join("template.typ"),
+                r#"#import "@local/my-pkg:1.0.0""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("template.typ")],
+                local: [("my-pkg".to_string(), pkg_dir.display().to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            let local_import = result
+                .imports
+                .iter()
+                .find(|i| i.namespace == "local")
+                .expect("should have @local import");
+            assert_eq!(local_import.name, "my-pkg");
+            assert!(local_import.direct);
+
+            let transitive = result
+                .imports
+                .iter()
+                .find(|i| i.name == "oxifmt")
+                .expect("should have transitive @preview/oxifmt");
+            assert_eq!(transitive.namespace, "preview");
+            assert_eq!(transitive.version, "0.2.1");
+            assert_eq!(transitive.source, "@local/my-pkg");
+            assert!(!transitive.direct);
+        }
+
+        #[test]
+        fn local_with_multiple_preview_deps() {
+            let dir = TempDir::new().unwrap();
+            let pkg_dir = dir.path().join("my-pkg-src");
+            create_local_package(
+                &pkg_dir,
+                "my-pkg",
+                "1.0.0",
+                Some("#import \"@preview/oxifmt:0.2.1\"\n#import \"@preview/codly:1.2.0\"\n"),
+            );
+
+            fs::write(
+                dir.path().join("template.typ"),
+                r#"#import "@local/my-pkg:1.0.0""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("template.typ")],
+                local: [("my-pkg".to_string(), pkg_dir.display().to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            let oxifmt = result.imports.iter().find(|i| i.name == "oxifmt").unwrap();
+            assert_eq!(oxifmt.source, "@local/my-pkg");
+            assert!(!oxifmt.direct);
+
+            let codly = result.imports.iter().find(|i| i.name == "codly").unwrap();
+            assert_eq!(codly.source, "@local/my-pkg");
+            assert!(!codly.direct);
+        }
+
+        #[test]
+        fn local_no_preview_recursion() {
+            let dir = TempDir::new().unwrap();
+            let pkg_dir = dir.path().join("my-pkg-src");
+            create_local_package(
+                &pkg_dir,
+                "my-pkg",
+                "1.0.0",
+                Some(r#"#import "@preview/cetz:0.4.1""#),
+            );
+
+            fs::write(
+                dir.path().join("template.typ"),
+                r#"#import "@local/my-pkg:1.0.0""#,
+            )
+            .unwrap();
+
+            // No package_cache — cetz's own transitive deps should NOT be resolved
+            let config = Config {
+                discover: vec![dir.path().join("template.typ")],
+                local: [("my-pkg".to_string(), pkg_dir.display().to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            // my-pkg and cetz should be present, but nothing deeper
+            assert!(result.imports.iter().any(|i| i.name == "my-pkg"));
+            assert!(result.imports.iter().any(|i| i.name == "cetz"));
+            assert_eq!(result.imports.len(), 2);
+        }
+
+        #[test]
+        fn local_dep_already_direct() {
+            let dir = TempDir::new().unwrap();
+            let pkg_dir = dir.path().join("my-pkg-src");
+            create_local_package(
+                &pkg_dir,
+                "my-pkg",
+                "1.0.0",
+                Some(r#"#import "@preview/cetz:0.4.1""#),
+            );
+
+            // Document also directly imports cetz
+            let content = "#import \"@preview/cetz:0.4.1\"\n#import \"@local/my-pkg:1.0.0\"\n";
+            fs::write(dir.path().join("template.typ"), content).unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("template.typ")],
+                local: [("my-pkg".to_string(), pkg_dir.display().to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            let cetz = result
+                .imports
+                .iter()
+                .find(|i| i.name == "cetz")
+                .expect("should find cetz");
+            assert!(cetz.direct, "direct should win over transitive");
+            assert_eq!(cetz.source, "template.typ");
+        }
+
+        #[test]
+        fn local_with_no_deps() {
+            let dir = TempDir::new().unwrap();
+            let pkg_dir = dir.path().join("my-pkg-src");
+            create_local_package(&pkg_dir, "my-pkg", "1.0.0", Some("// no imports"));
+
+            fs::write(
+                dir.path().join("template.typ"),
+                r#"#import "@local/my-pkg:1.0.0""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("template.typ")],
+                local: [("my-pkg".to_string(), pkg_dir.display().to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            assert_eq!(result.imports.len(), 1);
+            assert_eq!(result.imports[0].namespace, "local");
+        }
+
+        #[test]
+        fn local_missing_typst_toml() {
+            let dir = TempDir::new().unwrap();
+            let pkg_dir = dir.path().join("my-pkg-src");
+            fs::create_dir_all(&pkg_dir).unwrap();
+            fs::write(pkg_dir.join("lib.typ"), "// no manifest").unwrap();
+
+            fs::write(
+                dir.path().join("template.typ"),
+                r#"#import "@local/my-pkg:1.0.0""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("template.typ")],
+                local: [("my-pkg".to_string(), pkg_dir.display().to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            // Should still have the direct @local import from discover scanning
+            let local_import = result
+                .imports
+                .iter()
+                .find(|i| i.namespace == "local" && i.name == "my-pkg");
+            assert!(
+                local_import.is_some(),
+                "should still report @local import from discover"
+            );
+            assert!(local_import.unwrap().direct);
+        }
+
+        #[test]
+        fn local_missing_source_dir() {
+            let dir = TempDir::new().unwrap();
+            fs::write(
+                dir.path().join("template.typ"),
+                r#"#import "@local/my-pkg:1.0.0""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("template.typ")],
+                local: [("my-pkg".to_string(), "/nonexistent/path".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            // Direct import still present from discover scanning
+            let local_import = result
+                .imports
+                .iter()
+                .find(|i| i.namespace == "local" && i.name == "my-pkg");
+            assert!(local_import.is_some());
+            assert!(local_import.unwrap().direct);
+        }
+
+        #[test]
+        fn local_imports_another_local() {
+            let dir = TempDir::new().unwrap();
+            let pkg_dir = dir.path().join("my-pkg-src");
+            create_local_package(
+                &pkg_dir,
+                "my-pkg",
+                "1.0.0",
+                Some(r#"#import "@local/other-pkg:2.0.0""#),
+            );
+
+            fs::write(
+                dir.path().join("template.typ"),
+                r#"#import "@local/my-pkg:1.0.0""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("template.typ")],
+                local: [("my-pkg".to_string(), pkg_dir.display().to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            // Should report @local/other-pkg as transitive but not recurse into it
+            let other = result
+                .imports
+                .iter()
+                .find(|i| i.name == "other-pkg")
+                .expect("should find transitive @local/other-pkg");
+            assert_eq!(other.namespace, "local");
+            assert!(!other.direct);
+            assert_eq!(other.source, "@local/my-pkg");
+        }
+
+        #[test]
+        fn local_version_from_toml() {
+            let dir = TempDir::new().unwrap();
+            let pkg_dir = dir.path().join("my-pkg-src");
+            create_local_package(&pkg_dir, "my-pkg", "2.0.0", None);
+
+            // Config has [local] but no discover imports
+            let config = Config {
+                local: [("my-pkg".to_string(), pkg_dir.display().to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            let import = result
+                .imports
+                .iter()
+                .find(|i| i.name == "my-pkg")
+                .expect("should find @local/my-pkg");
+            assert_eq!(import.version, "2.0.0");
+        }
+
+        #[test]
+        fn discover_directory() {
+            let dir = TempDir::new().unwrap();
+            fs::write(dir.path().join("a.typ"), r#"#import "@preview/cetz:0.4.1""#).unwrap();
+            fs::write(
+                dir.path().join("b.typ"),
+                r#"#import "@preview/fletcher:0.5.3""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().to_path_buf()],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            assert_eq!(result.imports.len(), 2);
+            assert_eq!(result.files.len(), 2);
+        }
+
+        #[test]
+        fn discover_directory_non_recursive() {
+            let dir = TempDir::new().unwrap();
+            fs::write(dir.path().join("a.typ"), r#"#import "@preview/cetz:0.4.1""#).unwrap();
+            let sub = dir.path().join("subdir");
+            fs::create_dir_all(&sub).unwrap();
+            fs::write(sub.join("b.typ"), r#"#import "@preview/fletcher:0.5.3""#).unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().to_path_buf()],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            // Only a.typ should be found (non-recursive)
+            assert_eq!(result.imports.len(), 1);
+            assert_eq!(result.imports[0].name, "cetz");
+        }
+
+        #[test]
+        fn discover_single_file() {
+            let dir = TempDir::new().unwrap();
+            fs::write(
+                dir.path().join("template.typ"),
+                r#"#import "@preview/cetz:0.4.1""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("template.typ")],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            assert_eq!(result.imports.len(), 1);
+            assert_eq!(result.files, vec!["template.typ"]);
+        }
+
+        #[test]
+        fn discover_nonexistent_path() {
+            let config = Config {
+                discover: vec![PathBuf::from("/nonexistent/path.typ")],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            assert!(result.imports.is_empty());
+            assert!(result.files.is_empty());
+        }
+
+        #[test]
+        fn discover_mixed() {
+            let dir = TempDir::new().unwrap();
+            let sub = dir.path().join("subdir");
+            fs::create_dir_all(&sub).unwrap();
+            fs::write(sub.join("a.typ"), r#"#import "@preview/cetz:0.4.1""#).unwrap();
+            fs::write(
+                dir.path().join("single.typ"),
+                r#"#import "@preview/fletcher:0.5.3""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![sub, dir.path().join("single.typ")],
+                ..Default::default()
+            };
+            let result = analyze(&config).unwrap();
+
+            assert_eq!(result.imports.len(), 2);
+            assert_eq!(result.files.len(), 2);
+        }
+
+        #[test]
+        fn discover_non_typ_file() {
+            let dir = TempDir::new().unwrap();
+            fs::write(
+                dir.path().join("notes.txt"),
+                r#"#import "@preview/cetz:0.4.1""#,
+            )
+            .unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("notes.txt")],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            assert!(result.imports.is_empty());
+        }
+
+        #[test]
+        fn rootdir_resolves_discover() {
+            let dir = TempDir::new().unwrap();
+            let sub = dir.path().join("subdir");
+            fs::create_dir_all(&sub).unwrap();
+            fs::write(sub.join("template.typ"), r#"#import "@preview/cetz:0.4.1""#).unwrap();
+
+            let config = Config {
+                rootdir: Some(sub.clone()),
+                discover: vec![PathBuf::from("template.typ")],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            assert_eq!(result.imports.len(), 1);
+        }
+
+        #[test]
+        fn rootdir_resolves_local() {
+            let dir = TempDir::new().unwrap();
+            let sub = dir.path().join("subdir");
+            let pkg_dir = dir.path().join("pkg-src");
+            fs::create_dir_all(&sub).unwrap();
+            create_local_package(&pkg_dir, "my-pkg", "1.0.0", None);
+
+            let config = Config {
+                rootdir: Some(dir.path().to_path_buf()),
+                local: [("my-pkg".to_string(), "pkg-src".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            let import = result.imports.iter().find(|i| i.name == "my-pkg");
+            assert!(import.is_some());
+        }
+
+        #[test]
+        fn files_list_correct() {
+            let dir = TempDir::new().unwrap();
+            fs::write(dir.path().join("a.typ"), "= Hello").unwrap();
+            fs::write(dir.path().join("b.typ"), "= World").unwrap();
+
+            let config = Config {
+                discover: vec![dir.path().join("a.typ"), dir.path().join("b.typ")],
+                ..Default::default()
+            };
+            let result = analyze(&config);
+
+            assert_eq!(result.files.len(), 2);
+            assert!(result.files.contains(&"a.typ".to_string()));
+            assert!(result.files.contains(&"b.typ".to_string()));
+        }
+
+        #[test]
+        fn empty_discover() {
+            let config = Config::default();
+            let result = analyze(&config);
+
+            assert!(result.imports.is_empty());
+            assert!(result.files.is_empty());
         }
     }
 }
