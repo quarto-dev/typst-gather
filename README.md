@@ -55,10 +55,10 @@ my-template = "/path/to/src"
   - A single string path
   - An array of paths
   - Each path can be a `.typ` file or a directory (scans `.typ` files non-recursively)
-- `[preview]` — Packages downloaded from Typst Universe. Skipped if already cached.
-- `[local]` — Packages copied from a local directory. The source must contain a
-  `typst.toml` manifest with `name` and `version` fields. Always copies fresh
-  (overwrites any existing version).
+- `[preview]` — `@preview` packages downloaded from Typst Universe. Skipped if already cached.
+- `[local]` — `@local` packages copied from a local directory. The source must contain a
+  `typst.toml` manifest with `name` and `version` fields. Always copies clean slate
+  (removes destination before copying, so deleted/renamed source files don't linger).
 
 ## How it works
 
