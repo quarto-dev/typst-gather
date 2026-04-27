@@ -2235,7 +2235,6 @@ dependencies = [
  "clap",
  "ecow",
  "globset",
- "openssl",
  "serde",
  "serde_json",
  "tempfile",

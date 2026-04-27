@@ -15,11 +15,10 @@ clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 walkdir = "2"
 globset = "0.4"
-openssl = { version = "0.10", features = ["vendored"], optional = true }
 
 [features]
 default = []
-vendored-openssl = ["openssl"]
+vendored-openssl = ["typst-kit/vendor-openssl"]
 
 [dev-dependencies]
 tempfile = "3"
