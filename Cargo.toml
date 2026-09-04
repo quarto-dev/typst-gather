@@ -1,6 +1,6 @@
 [package]
 name = "typst-gather"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "Gather Typst packages locally for offline/hermetic builds."
 license = "MIT"
